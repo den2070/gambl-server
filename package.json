@@ -1,0 +1,13 @@
+{
+  "name": "casino-3d-multiplayer-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WebSocket room relay for Casino 3D",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
