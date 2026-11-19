@@ -3,11 +3,44 @@
 // Use WSS behind HTTPS for public internet deployment.
 const WebSocket = require('ws');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const PORT = Number(process.env.PORT || 8080);
 const wss = new WebSocket.Server({ port: PORT, maxPayload: 16 * 1024 });
 
 const rooms = new Map();
 const roomData = new Map();
+// Render's persistent disk should be mounted at /var/data (set DATA_DIR=/var/data).
+// Without a mounted disk, the fallback ./data folder is only as persistent as the host filesystem.
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'rooms.json');
+function loadRoomData() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    for (const [room, value] of Object.entries(parsed || {})) {
+      if (!/^[A-Z0-9]{1,12}$/.test(room) || !value || typeof value !== 'object') continue;
+      roomData.set(room, { hostUid: null, sharedState: cleanSharedState(value.sharedState), actionSeq: 0 });
+    }
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.warn('Could not load saved room data:', err.message);
+  }
+}
+let persistTimer = null;
+function persistRoomData() {
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      const snapshot = {};
+      for (const [room, info] of roomData.entries()) {
+        if (info.sharedState) snapshot[room] = { sharedState: info.sharedState };
+      }
+      const tmp = DATA_FILE + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(snapshot));
+      fs.renameSync(tmp, DATA_FILE);
+    } catch (err) { console.error('Could not save room data:', err.message); }
+  }, 400);
+}
 const ACTIONS_PER_SECOND = 12;
 
 function members(room) { return rooms.get(room) || new Set(); }
@@ -32,10 +65,10 @@ function cleanSharedState(s) {
   const perks = {};
   for (const key of ['clover', 'espresso', 'loaded_dice', 'vip_watch', 'shield_chip']) perks[key] = !!s.perks?.[key];
   return {
-    balance: Math.round(clampNum(s.balance, 0, 1e9)),
-    night: Math.floor(clampNum(s.night, 1, 100000)),
-    currentFloor: Math.floor(clampNum(s.currentFloor, 1, 3)),
-    unlockedFloors: Math.floor(clampNum(s.unlockedFloors, 1, 3)),
+    balance: Math.round(clampNum(s.balance, 0, 1e12)),
+    night: Math.floor(clampNum(s.night, 1, 1000000)),
+    currentFloor: Math.floor(clampNum(s.currentFloor, 1, 1000000)),
+    unlockedFloors: Math.floor(clampNum(s.unlockedFloors, 1, 1000000)),
     target: Math.round(clampNum(s.target, 1, 1e9)),
     timeLeft: clampNum(s.timeLeft, 0, 3600),
     nightDuration: clampNum(s.nightDuration, 1, 3600),
@@ -45,6 +78,8 @@ function cleanSharedState(s) {
     state: s.state === 'GAME_OVER' ? 'GAME_OVER' : 'PLAYING'
   };
 }
+
+loadRoomData();
 
 wss.on('connection', (ws) => {
   ws.room = null;
@@ -83,7 +118,7 @@ wss.on('connection', (ws) => {
       const state = {
         name: String(p.name || 'PLAYER').slice(0, 16),
         x: clampNum(p.x, -12, 12), z: clampNum(p.z, -10, 10),
-        yaw: clampNum(p.yaw, -1000, 1000), floor: Math.floor(clampNum(p.floor, 1, 3)),
+        yaw: clampNum(p.yaw, -1000, 1000), floor: Math.floor(clampNum(p.floor, 1, 1000000)),
         updatedAt: Date.now()
       };
       broadcast(ws.room, { type: 'state', uid: ws.uid, state });
@@ -93,7 +128,8 @@ wss.on('connection', (ws) => {
     if (msg.type === 'worldState') {
       if (ws.uid !== roomInfo.hostUid) return;
       const s = msg.state || {};
-      roomInfo.sharedState = { balance: Math.round(clampNum(s.balance, 0, 1e9)), night: Math.floor(clampNum(s.night,1,100000)), timeLeft: clampNum(s.timeLeft,0,3600), target: Math.round(clampNum(s.target,1,1e9)) };
+      roomInfo.sharedState = { ...(roomInfo.sharedState || {}), balance: Math.round(clampNum(s.balance, 0, 1e12)), night: Math.floor(clampNum(s.night,1,1000000)), timeLeft: clampNum(s.timeLeft,0,3600), target: Math.round(clampNum(s.target,1,1e12)), unlockedFloors: Math.floor(clampNum(s.unlockedFloors,1,1000000)), currentFloor: Math.floor(clampNum(s.currentFloor,1,1000000)) };
+      persistRoomData();
       broadcast(ws.room, { type:'worldState', state:roomInfo.sharedState });
       return;
     }
@@ -156,7 +192,9 @@ wss.on('connection', (ws) => {
     }
     if (members(room).size === 0) {
       rooms.delete(room);
-      roomData.delete(room);
+      const info = dataFor(room);
+      info.hostUid = null;
+      persistRoomData();
     } else presence(room);
   });
 });
