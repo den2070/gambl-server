@@ -300,6 +300,8 @@ wss.on('connection', (ws) => {
         x: Number(msg.state.x) || 0,
         y: Number(msg.state.y) || 0,
         z: Number(msg.state.z) || 0,
+        vy: Number(msg.state.vy) || 0,
+        jumping: !!msg.state.jumping || (Number(msg.state.y) || 0) > 0.05,
         yaw: Number(msg.state.yaw) || 0,
         hasBat: !!msg.state.hasBat,
         updatedAt: Date.now()
@@ -309,6 +311,36 @@ wss.on('connection', (ws) => {
         uid,
         room: roomCode,
         state: msg.state
+      });
+      return;
+    }
+
+    if (msg.type === 'playerJump') {
+      const prev = room.players.get(uid) || { uid, lastHitAt: 0 };
+      const jx = Number.isFinite(Number(msg.x)) ? Number(msg.x) : (prev.x || 0);
+      const jy = Math.max(0.05, Number(msg.y) || 0.12);
+      const jz = Number.isFinite(Number(msg.z)) ? Number(msg.z) : (prev.z || 0);
+      const jvy = Number(msg.vy) || 6.4;
+      room.players.set(uid, {
+        ...prev,
+        uid,
+        floor,
+        x: jx,
+        y: jy,
+        z: jz,
+        vy: jvy,
+        jumping: true,
+        updatedAt: Date.now()
+      });
+      broadcastToRoom(roomCode, ws, {
+        type: 'playerJump',
+        room: roomCode,
+        uid,
+        floor,
+        x: jx,
+        y: jy,
+        z: jz,
+        vy: jvy
       });
       return;
     }
