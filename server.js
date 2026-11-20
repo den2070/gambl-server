@@ -5,7 +5,7 @@ const PORT = process.env.PORT || 8080;
 const TICK_MS = 50; // 20 тиков в секунду
 const PLAYER_HIT_COOLDOWN_MS = 5000;
 
-const ALL_GAME_TYPES = ['slots', 'plinko', 'dice', 'blackjack', 'ducks', 'roulette', 'crash', 'wheel'];
+const ALL_GAME_TYPES = ['slots', 'plinko', 'dice', 'blackjack', 'ducks', 'roulette', 'crash', 'wheel', 'mines', 'dragon', 'coin', 'hilo'];
 
 const MACHINE_THEMES = {
   slots: {
@@ -58,6 +58,10 @@ const MACHINE_THEMES = {
     minCrash: 1.25,
     maxCrash: 5.5
   },
+  mines: { badge: 'MINE FIELD', accentColor: '#22c55e', beaconHex: 0x22c55e },
+  dragon: { badge: 'DRAGON TOWER', accentColor: '#a855f7', beaconHex: 0xa855f7 },
+  coin: { badge: 'COIN FLIP', accentColor: '#fbbf24', beaconHex: 0xfbbf24 },
+  hilo: { badge: 'HI-LO CARDS', accentColor: '#ec4899', beaconHex: 0xec4899 },
   wheel: {
     badge: 'MEGA FORTUNE',
     accentColor: '#eab308',
@@ -174,7 +178,8 @@ function ensureRoom(roomCode) {
       clients: new Set(),
       players: new Map(), // uid -> { uid, name, floor, x, y, z, yaw, hasBat, lastHitAt, updatedAt }
       rng,
-      visitorsByFloor
+      visitorsByFloor,
+      economy: null // { night, balance, ... } — последняя известная общая экономика комнаты
     });
   }
   return rooms.get(roomCode);
@@ -252,7 +257,7 @@ wss.on('connection', (ws) => {
       ws.send(JSON.stringify({
         type: 'joined',
         room: roomCode,
-        version: '1.0 RELEASE',
+        version: '2.0 RELEASE',
         floor,
         playersCount: room.clients.size,
         machinesCount: machines.length,
@@ -275,6 +280,10 @@ wss.on('connection', (ws) => {
           moveElapsed: v.moveElapsed
         }))
       }));
+
+      if (room.economy) {
+        ws.send(JSON.stringify({ type: 'localEconomySync', room: roomCode, economy: room.economy }));
+      }
 
       broadcastAllInRoom(roomCode, {
         type: 'presence',
@@ -520,6 +529,14 @@ wss.on('connection', (ws) => {
         logText: `посетитель ${v.id} ударен на ${hitAtSec} сек в направлении ${angleDeg} градусов`
       });
       return;
+    }
+
+    // Общая экономика: сервер помнит ночь комнаты и отбрасывает устаревшие пакеты,
+    // иначе отстающий клиент откатывает всех обратно на прошлую ночь.
+    if (['localEconomySync', 'localEconomyDelta', 'nightAdvance', 'localEconomyReset'].includes(msg.type) && msg.economy) {
+      const curNight = room.economy ? Number(room.economy.night) || 1 : 0;
+      if (msg.type !== 'localEconomyReset' && Number(msg.economy.night) < curNight) return;
+      room.economy = { ...msg.economy };
     }
 
     broadcastToRoom(roomCode, ws, {
