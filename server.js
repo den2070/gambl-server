@@ -2,7 +2,8 @@ const WebSocket = require('ws');
 const http = require('http');
 
 const PORT = process.env.PORT || 8080;
-const TICK_MS = 50; // 20 тиков в секунду
+const TICK_MS = 20; // server simulation tick
+const VISITOR_BROADCAST_MS = 250; // NPC snapshots only 4 times/sec
 const PLAYER_HIT_COOLDOWN_MS = 5000;
 
 const ALL_GAME_TYPES = ['slots', 'plinko', 'dice', 'blackjack', 'ducks', 'roulette', 'crash', 'wheel', 'mines', 'dragon', 'coin', 'hilo'];
@@ -233,6 +234,7 @@ function ensureRoom(roomCode) {
       rng,
       visitorsByFloor,
       processedEvents: new Map(),
+      lastVisitorBroadcastAt: new Map(),
       economy: {
         night: 1,
         unlockedFloors: 1,
@@ -291,11 +293,20 @@ wss.on('connection', (ws) => {
     if (msg.type === 'join') {
       const roomCode = String(msg.room || 'CASINO777').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12) || 'CASINO777';
       const floor = Math.max(1, Number(msg.floor) || 1);
-      const uid = msg.uid || ('u_' + Math.random().toString(36).slice(2, 8));
+      const requestedUid = String(msg.uid || ('u_' + Math.random().toString(36).slice(2, 8))).slice(0, 100);
+      const room = ensureRoom(roomCode);
+      // Firebase anonymous auth is shared across tabs. If two tabs arrive with
+      // the same requested UID, give the later socket its own room identity.
+      const duplicateLiveUid = [...room.clients].some((client) =>
+        client !== ws && client.uid === requestedUid && client.readyState === WebSocket.OPEN
+      );
+      const uid = duplicateLiveUid
+        ? `${requestedUid.slice(0, 64)}_tab_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+        : requestedUid;
       ws.roomCode = roomCode;
       ws.uid = uid;
+      ws.requestedUid = requestedUid;
 
-      const room = ensureRoom(roomCode);
       room.clients.add(ws);
       const previousPlayer = room.players.get(uid);
       room.players.set(uid, {
@@ -332,6 +343,8 @@ wss.on('connection', (ws) => {
       ws.send(JSON.stringify({
         type: 'joined',
         room: roomCode,
+        sessionUid: uid,
+        requestedUid,
         version: '2.0 RELEASE',
         floor,
         playersCount: room.clients.size,
@@ -377,7 +390,7 @@ wss.on('connection', (ws) => {
     const roomCode = ws.roomCode || (msg.room ? String(msg.room).toUpperCase() : null);
     if (!roomCode) return;
     const room = ensureRoom(roomCode);
-    const uid = ws.uid || msg.uid;
+    const uid = ws.uid;
     if (!uid) return;
     if (ws.roomCode && msg.room && String(msg.room).toUpperCase() !== ws.roomCode) return;
     const floor = Math.max(1, Number(msg.floor) || 1);
@@ -585,6 +598,45 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    if (msg.type === 'fr_place') {
+      const targetUid = String(msg.targetUid || '');
+      const targetPlayer = room.players.get(targetUid);
+      const machineId = String(msg.machineId || '').slice(0, 100);
+      const targetFloor = Math.max(1, Number(targetPlayer?.floor) || floor);
+      const eid = String(msg.eid || `place_${uid}_${targetUid}_${Date.now()}`).slice(0, 100);
+      if (!targetUid || targetUid === uid || !targetPlayer) {
+        ws.send(JSON.stringify({ type: 'fr_error', room: roomCode, targetUid, reason: 'target_not_online' }));
+        return;
+      }
+      if (targetPlayer.mode !== 'carried' || targetPlayer.holderUid !== uid) {
+        ws.send(JSON.stringify({ type: 'fr_error', room: roomCode, targetUid, reason: 'target_not_held_by_sender' }));
+        return;
+      }
+      if (targetFloor !== floor || !getFloorMachines(roomCode, targetFloor).some((machine) => machine.id === machineId)) {
+        ws.send(JSON.stringify({ type: 'fr_error', room: roomCode, targetUid, reason: 'invalid_machine' }));
+        return;
+      }
+      if (rememberEvent(room, `fr_place:${eid}`)) return;
+      const now = Date.now();
+      room.players.set(targetUid, {
+        ...targetPlayer,
+        mode: 'bet',
+        holderUid: uid,
+        activityId: eid,
+        machineId,
+        lastThrow: { kind: 'machine', machineId, at: now },
+        updatedAt: now
+      });
+      // Compact protocol: target player + machine id + activity id; clients
+      // derive the local animation from their deterministic machine layout.
+      broadcastToRoom(roomCode, ws, {
+        type: 'fr_place', room: roomCode, uid, targetUid,
+        machineId, eid, floor: targetFloor,
+        status: 'bet', updatedAt: now
+      });
+      return;
+    }
+
     if (msg.type === 'fr_bet' || msg.type === 'fr_result') {
       const targetUid = String(msg.targetUid || '');
       if (!targetUid || targetUid === uid) return;
@@ -631,20 +683,36 @@ wss.on('connection', (ws) => {
       const targetUid = String(msg.targetUid || '');
       if (!targetUid || targetUid === uid) return;
       const player = room.players.get(targetUid);
-      if (player) {
-        const carried = msg.type !== 'fr_drop';
-        room.players.set(targetUid, {
-          ...player,
-          mode: carried ? 'carried' : 'casino',
-          holderUid: carried ? uid : null,
-          x: Number.isFinite(Number(msg.x)) ? Number(msg.x) : player.x,
-          y: Number.isFinite(Number(msg.y)) ? Number(msg.y) : player.y,
-          z: Number.isFinite(Number(msg.z)) ? Number(msg.z) : player.z,
-          lastThrow: msg.type === 'fr_drop' ? null : (player.lastThrow || null),
-          updatedAt: Date.now()
-        });
+      if (!player) {
+        ws.send(JSON.stringify({ type: 'fr_error', room: roomCode, targetUid, reason: 'target_not_online' }));
+        return;
       }
-      broadcastToRoom(roomCode, ws, { ...msg, uid, targetUid, room: roomCode, updatedAt: Date.now() });
+      if (player.mode === 'taken' || player.mode === 'escape' || player.mode === 'bet') {
+        ws.send(JSON.stringify({ type: 'fr_error', room: roomCode, targetUid, reason: 'target_busy' }));
+        return;
+      }
+      if (msg.type === 'fr_grab' && player.holderUid) {
+        ws.send(JSON.stringify({ type: 'fr_error', room: roomCode, targetUid, reason: 'target_already_held' }));
+        return;
+      }
+      if ((msg.type === 'fr_carry' || msg.type === 'fr_drop') && player.holderUid !== uid) {
+        ws.send(JSON.stringify({ type: 'fr_error', room: roomCode, targetUid, reason: 'not_current_holder' }));
+        return;
+      }
+      const now = Date.now();
+      const carried = msg.type !== 'fr_drop';
+      const updatedTarget = {
+        ...player,
+        mode: carried ? 'carried' : 'casino',
+        holderUid: carried ? uid : null,
+        x: Number.isFinite(Number(msg.x)) ? Number(msg.x) : player.x,
+        y: Number.isFinite(Number(msg.y)) ? Number(msg.y) : player.y,
+        z: Number.isFinite(Number(msg.z)) ? Number(msg.z) : player.z,
+        lastThrow: msg.type === 'fr_drop' ? null : (player.lastThrow || null),
+        updatedAt: now
+      };
+      room.players.set(targetUid, updatedTarget);
+      broadcastToRoom(roomCode, ws, { ...msg, uid, targetUid, room: roomCode, updatedAt: now, targetMode: updatedTarget.mode });
       return;
     }
 
@@ -921,7 +989,14 @@ setInterval(() => {
       }
     }
 
+    const occupiedFloors = new Set();
+    for (const player of room.players.values()) {
+      const connected = [...room.clients].some((client) => client.uid === player.uid && client.readyState === WebSocket.OPEN);
+      if (connected) occupiedFloors.add(Math.max(1, Number(player.floor) || 1));
+    }
+
     for (const [floor, visitors] of room.visitorsByFloor.entries()) {
+      if (!occupiedFloors.has(floor)) continue;
       const moveCommands = [];
 
       for (const v of visitors) {
@@ -981,6 +1056,9 @@ setInterval(() => {
         }
       }
 
+      const lastSent = room.lastVisitorBroadcastAt.get(floor) || 0;
+      if (now - lastSent < VISITOR_BROADCAST_MS) continue;
+      room.lastVisitorBroadcastAt.set(floor, now);
       broadcastAllInRoom(roomCode, {
         type: 'visitorSnapshot',
         room: roomCode,
